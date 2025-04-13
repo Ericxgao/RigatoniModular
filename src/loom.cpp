@@ -37,13 +37,18 @@ inline static uint64_t flipNibbleEndian(uint64_t a) {
 }
 
 float scaleLength(float knobValue) {
+    #ifdef METAMODULE
+    return clamp(dsp::exp2_taylor5(knobValue) * 8.43f - 1.61f, 1.f, 32.f);
+    #else
     return clamp(dsp::exp2_taylor5(knobValue) * 16.8f - 3.2f, 1.f, 64.f);
+    #endif
 }
 
 float scaleStride(float knobValue) {
     return clamp(dsp::exp2_taylor5(knobValue) * 1.333333333333f - 1.333333333333f, 0.f, 4.f);
 }
 
+#ifndef METAMODULE
 void shapeAmplitudes(
     std::array<float_4, 16> &amplitudes,
     uint64_t harmonicMask,
@@ -76,6 +81,67 @@ void shapeAmplitudes(
         shiftAmt -= 4;
     }
 }
+#else
+void shapeAmplitudes(
+    std::array<float_4, 16> &amplitudes,
+    uint64_t harmonicMask,
+    int numBlocks,
+    float length,
+    int tilt, // 0-2 (lowpass, bandpass, highpass)
+    float pivotHarm,
+    float intensity
+) {
+    constexpr float SLOPE_SCALE = 0.005f;
+    
+    // Precompute slopes and pivotBase once instead of checking tilt each iteration
+    float_4 belowSlope, aboveSlope, pivotBase;
+    
+    // Use a direct lookup instead of the 2D array access and branching
+    switch (tilt) {
+        case 0: // lowpass
+            belowSlope = 0.f;
+            aboveSlope = 10.f * SLOPE_SCALE * intensity;
+            pivotBase = intensity > 0.f ? 0.f : 0.f; // simplified
+            break;
+        case 1: // bandpass
+            belowSlope = -15.f * SLOPE_SCALE * intensity;
+            aboveSlope = 15.f * SLOPE_SCALE * intensity;
+            pivotBase = intensity > 0.f ? 0.25f * intensity : 0.f;
+            break;
+        case 2: // highpass
+        default:
+            belowSlope = -10.f * SLOPE_SCALE * intensity;
+            aboveSlope = 0.f;
+            pivotBase = intensity > 0.f ? 0.f : 0.f; // simplified
+            break;
+    }
+
+    // Precompute pivot differences for the first block
+    float_4 pivotDiffs = pivotHarm - float_4(0.f, 1.f, 2.f, 3.f);
+    
+    // Flip nibbles once outside the loop
+    harmonicMask = flipNibbleEndian(harmonicMask);
+    
+    // Start with the highest shift amount
+    uint32_t shiftAmt = AMP_SHIFT;
+    
+    for (int i = 0; i < numBlocks; i++) {
+        // Compute slopes only where needed based on pivot differences
+        float_4 slopes = simd::ifelse(pivotDiffs > 0.f, belowSlope, aboveSlope);
+        
+        // Extract the appropriate nibble from the mask
+        auto addMask = simd::movemaskInverse<float_4>((harmonicMask >> shiftAmt) & AMP_MASK);
+        
+        // Apply the shaping
+        auto toAdd = addMask & (pivotBase + slopes * pivotDiffs);
+        amplitudes[i] = clamp(amplitudes[i] + toAdd, 0.f, 1.5f);
+
+        // Update for the next block
+        pivotDiffs -= 4.f;
+        shiftAmt -= 4;
+    }
+}
+#endif
 
 inline float calculateFrequencyHz(float expCv, float linCv, float multiplier) {
     // Clamp to max frequency, allow negative frequency for thru-zero linear FM
@@ -273,6 +339,10 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
 
         // Shaping section
         shapeAmplitudes(harmonicAmplitudes, harmonicMask, numBlocks, length, tilt, pivotHarm, intensity);
+
+        #ifdef METAMODULE
+        numBlocks = std::min(numBlocks, 4);
+        #endif
 
         // Fundamental boosting
         harmonicAmplitudes[0] = simd::fmax(harmonicAmplitudes[0], this->boostFund ? float_4(.5f, 0.f, 0.f, 0.f) : 0.f);
