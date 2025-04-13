@@ -278,7 +278,12 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
         *harmonicMask = 0xffffffffffffffff << (64 - harmonicLimit);
         int iLengthLow = (int)std::floor(length);
         int iLengthHigh = std::min(iLengthLow + 1, 64);
+        #ifdef METAMODULE
+        *numBlocks = std::min((std::min(harmonicLimit, iLengthHigh) + 0b11) >> 2, 4);
+        #else
         *numBlocks = (std::min(harmonicLimit, iLengthHigh) + 0b11) >> 2;
+        #endif
+
         float lengthFade = length - iLengthLow;
 
         this->setAmplitudesHalf(amplitudes, iLengthHigh, lengthFade, density, shift, *harmonicMask, *numBlocks);
@@ -339,10 +344,6 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
 
         // Shaping section
         shapeAmplitudes(harmonicAmplitudes, harmonicMask, numBlocks, length, tilt, pivotHarm, intensity);
-
-        #ifdef METAMODULE
-        numBlocks = std::min(numBlocks, 4);
-        #endif
 
         // Fundamental boosting
         harmonicAmplitudes[0] = simd::fmax(harmonicAmplitudes[0], this->boostFund ? float_4(.5f, 0.f, 0.f, 0.f) : 0.f);
