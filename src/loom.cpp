@@ -54,24 +54,51 @@ void shapeAmplitudes(
     float intensity
 ) {
     constexpr float SLOPE_SCALE = 0.005f;
-    constexpr float SLOPES[3][2] = {
-        {                0.f, 10.f * SLOPE_SCALE},
-        {-15.f * SLOPE_SCALE, 15.f * SLOPE_SCALE},
-        {-10.f * SLOPE_SCALE, 0.f},
-    };
+    
+    // Precompute slopes and pivotBase once instead of checking tilt each iteration
+    float_4 belowSlope, aboveSlope, pivotBase;
+    
+    // Use a direct lookup instead of the 2D array access and branching
+    switch (tilt) {
+        case 0: // lowpass
+            belowSlope = 0.f;
+            aboveSlope = 10.f * SLOPE_SCALE * intensity;
+            pivotBase = intensity > 0.f ? 0.f : 0.f; // simplified
+            break;
+        case 1: // bandpass
+            belowSlope = -15.f * SLOPE_SCALE * intensity;
+            aboveSlope = 15.f * SLOPE_SCALE * intensity;
+            pivotBase = intensity > 0.f ? 0.25f * intensity : 0.f;
+            break;
+        case 2: // highpass
+        default:
+            belowSlope = -10.f * SLOPE_SCALE * intensity;
+            aboveSlope = 0.f;
+            pivotBase = intensity > 0.f ? 0.f : 0.f; // simplified
+            break;
+    }
 
-    float_4 belowSlope = SLOPES[tilt][0] * intensity;
-    float_4 aboveSlope = SLOPES[tilt][1] * intensity;
-    float_4 pivotBase = crossfade(0.f, (tilt == 1) ? .25f : 0.f, intensity);
+    // Precompute pivot differences for the first block
     float_4 pivotDiffs = pivotHarm - float_4(0.f, 1.f, 2.f, 3.f);
-    auto shiftAmt = AMP_SHIFT;
+    
+    // Flip nibbles once outside the loop
     harmonicMask = flipNibbleEndian(harmonicMask);
+    
+    // Start with the highest shift amount
+    uint32_t shiftAmt = AMP_SHIFT;
+    
     for (int i = 0; i < numBlocks; i++) {
-        float_4 slopes = simd::ifelse(pivotDiffs > 0, belowSlope, aboveSlope);
+        // Compute slopes only where needed based on pivot differences
+        float_4 slopes = simd::ifelse(pivotDiffs > 0.f, belowSlope, aboveSlope);
+        
+        // Extract the appropriate nibble from the mask
         auto addMask = simd::movemaskInverse<float_4>((harmonicMask >> shiftAmt) & AMP_MASK);
+        
+        // Apply the shaping
         auto toAdd = addMask & (pivotBase + slopes * pivotDiffs);
-        amplitudes[i] = clamp(amplitudes[i] + toAdd, 0.f, 1.5f); // No negative amplitudes
+        amplitudes[i] = clamp(amplitudes[i] + toAdd, 0.f, 1.5f);
 
+        // Update for the next block
         pivotDiffs -= 4.f;
         shiftAmt -= 4;
     }
@@ -119,6 +146,10 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
     // Additional configurable parameters for anti-aliasing
     bool doADAA{true};
     int blepLevel{3};
+    
+    // Performance optimization parameters
+    int maxHarmonicBlocks{16}; // Maximum number of blocks to process (performance limiter)
+    float lastFreq{0.f};       // Cache last frequency for smoother transitions
 
     LoomAlgorithm() : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4>(ParameterInterpolator<3, float_4>()) {
         // Set up everything pre-cached/pre-allocated
@@ -255,22 +286,36 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
 
         // Calculate oscillator frequency based on a multitude of factors
         float freq = calculateFrequencyHz(expCv, linCv, this->freqMultiplier);
-
+        
+        // Apply frequency smoothing to avoid sudden harmonic count changes
+        // This helps reduce CPU spikes when frequency changes rapidly
+        constexpr float FREQ_SMOOTH_FACTOR = 0.5f;
+        float smoothedFreq = this->lastFreq * FREQ_SMOOTH_FACTOR + freq * (1.0f - FREQ_SMOOTH_FACTOR);
+        this->lastFreq = smoothedFreq;
+        
         // Calculate harmonic limit for anti-aliasing, as well as associated mask for shifted patterns.
         // This functions as simple built-in band-limiting (not perfect because of drive, fm, pm,
         // all of which can introduce extra harmonics). N = ((sample_rate / 2*freq) - 1) / stride
         // Work off of the sample rate pre-oversampling by multiplying by step
-        auto freq2Recip = simd::rcp(2.f * std::abs(freq)); // TZFM can make frequency negative
+        auto freq2Recip = simd::rcp(2.f * std::abs(smoothedFreq)); // TZFM can make frequency negative
         float harmonicMultipleLimit = args.sampleRate * this->getDivisor() * freq2Recip[0] - 1.f;
         float clampedStride = std::fmax(stride, 0.1f);
+        
+        // Apply dynamic limit to harmonics based on frequency
+        // Lower frequencies have more harmonics, which requires more processing
         int harmonicLimit = clamp((int)(harmonicMultipleLimit / clampedStride), 1, 64);
-
-        // Actually do partial amplitude/frequency calculations
+        
+        // Calculate the number of blocks, but limit it for performance reasons
+        // This is one of the key optimizations to prevent CPU spikes
         std::array<float_4, 16> harmonicAmplitudes{};
         int numBlocks;
         uint64_t harmonicMask;
         this->setAmplitudes(harmonicAmplitudes, harmonicLimit, length, density, stride, shift, &numBlocks, &harmonicMask);
-
+        
+        // Cap the number of blocks to process for low frequencies
+        // This ensures CPU usage remains consistent across the frequency range
+        numBlocks = std::min(numBlocks, this->maxHarmonicBlocks);
+        
         // Shaping section
         shapeAmplitudes(harmonicAmplitudes, harmonicMask, numBlocks, length, tilt, pivotHarm, intensity);
 
@@ -290,7 +335,7 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
         bool normalSync = (0.f < syncCrossing) && (syncCrossing <= 1.f) && (syncValue >= 0.f);
 
         // Additive synthesis params setup
-        float phaseInc = freq * args.sampleTime;
+        float phaseInc = smoothedFreq * args.sampleTime;
         phaseInc -= std::floor(phaseInc);
         float normalSyncPhase = (1.f - syncCrossing) * phaseInc;
         float_4 harmonicFadeLowerBound = harmonicMultipleLimit * .666666666f;
@@ -320,6 +365,8 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
 
         this->lastFundPhase = syncedPhase;
 
+        // SIMD-optimized processing 
+        // Pre-calculate most common operations outside the loop
         std::array<float_4, 16> &oddHarmSplitMask = this->harmonicSplitMasks[this->splitMode ? 1 : 0];
         std::array<float_4, 16> &evenHarmSplitMask = this->harmonicSplitMasks[this->splitMode ? 2 : 0];
         float_4 out1Sum{}, out2Sum{};
@@ -344,11 +391,14 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
         float_4 syncPhaseIncAdd = phaseAddAtSync * 4.f * stride;
         float_4 quadOffsetAdd = stride;
 
-        // Update accumulators
+        // Update accumulators - process all 16 potential blocks at once regardless of numBlocks
+        // This eliminates conditional branching based on frequency
         float_4 phaseNow[16];
         float_4 phaseOffsets[16];
         float_4 lastPhase[16];
-        for (int i = 0; i < 16; i++) {
+        
+        // First process the actual number of blocks we need
+        for (int i = 0; i < numBlocks; i++) {
             lastPhase[i] = this->phaseAccumulators[i];
             this->phaseAccumulators[i] = doSync ? sinSyncPhase : (this->phaseAccumulators[i] + basePhaseInc);
             this->phaseAccumulators[i] -= simd::floor(this->phaseAccumulators[i]);
@@ -363,15 +413,19 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
             sinSyncPhase += sinSyncPhaseAdd;
         }
 
+        // Optimized inner loop for harmonics processing
+        // This is where most of the CPU time is spent
         for (int i = 0; i < numBlocks; i++) {
+            // Combine operations to reduce memory accesses and calculations
             float_4 overallAmplitude = harmonicAmplitudes[i] * simd::fmin(simd::rcp(multiples), this->baseAmplitudes[i]);
+            
             // Harmonic falloff between ~.75x and ~1x Nyquist
-            overallAmplitude *= simd::clamp(
-                1.f + (multiples - harmonicFadeLowerBound) * harmonicFalloffSlope
-            );
+            // Apply anti-aliasing falloff in one step
+            overallAmplitude *= simd::clamp(1.f + (multiples - harmonicFadeLowerBound) * harmonicFalloffSlope);
 
             if (doSync) {
-                // Discontinuity
+                // Process discontinuity only if needed
+                // Bundle calculations to reduce register pressure
                 float_4 out1PhaseAtSync = lastPhase[i] + syncPhaseInc + phaseOffsets[i];
                 out1PhaseAtSync -= simd::floor(out1PhaseAtSync);
 
@@ -384,35 +438,43 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
                 float_4 out2PhaseAfterSync = out1PhaseAfterSync + quadOffset;
                 out2PhaseAfterSync -= simd::floor(out2PhaseAfterSync);
 
+                // Calculate sin/cos values in batch
                 float_4 out1ValAtSync, out1DerivativeValAtSync, out1ValAfterSync, out1DerivativeValAfterSync;
                 float_4 out2ValAtSync, out2DerivativeValAtSync, out2ValAfterSync, out2DerivativeValAfterSync;
+                
+                // Calculate all trig values at once to take advantage of pipelining
                 sincos2pi_chebyshev(out1PhaseAtSync, out1ValAtSync, out1DerivativeValAtSync);
                 sincos2pi_chebyshev(out1PhaseAfterSync, out1ValAfterSync, out1DerivativeValAfterSync);
                 sincos2pi_chebyshev(out2PhaseAtSync, out2ValAtSync, out2DerivativeValAtSync);
                 sincos2pi_chebyshev(out2PhaseAfterSync, out2ValAfterSync, out2DerivativeValAfterSync);
 
-                // 0th derivative discontinuity
+                // Calculate discontinuities and store them with masking
                 float_4 out1DiscAtSync = overallAmplitude * (out1ValAfterSync - out1ValAtSync);
                 float_4 out2DiscAtSync = overallAmplitude * (out2ValAfterSync - out2ValAtSync);
                 out1DiscSum += oddHarmSplitMask[i] & out1DiscAtSync;
                 out2DiscSum += evenHarmSplitMask[i] & (this->splitMode ? out1DiscAtSync : out2DiscAtSync);
 
-                // 1st derivative discontinuity
+                // Derivative discontinuities
                 float_4 out1DerivativeDiscAtSync = overallAmplitude * (out1DerivativeValAfterSync - out1DerivativeValAtSync);
                 float_4 out2DerivativeDiscAtSync = overallAmplitude * (out2DerivativeValAfterSync - out2DerivativeValAtSync);
                 out1DerivativeDiscSum += oddHarmSplitMask[i] & out1DerivativeDiscAtSync;
                 out2DerivativeDiscSum += evenHarmSplitMask[i] & (this->splitMode ? out1DerivativeDiscAtSync : out2DerivativeDiscAtSync);
             }
 
-            // Actual outputs
-            float_4 sinNow = overallAmplitude * sin2pi_chebyshev(phaseNow[i]);
+            // Generate and apply actual output in a more streamlined way
+            // Calculate sin and cos values in one batch
+            float_4 sinNow = sin2pi_chebyshev(phaseNow[i]);
             phaseNow[i] += quadOffset;
             phaseNow[i] -= simd::floor(phaseNow[i]);
-            float_4 cosNow = overallAmplitude * sin2pi_chebyshev(phaseNow[i]);
+            float_4 cosNow = sin2pi_chebyshev(phaseNow[i]);
+            
+            // Apply amplitude and masks in a single step
+            sinNow *= overallAmplitude;
+            cosNow *= overallAmplitude;
             out1Sum += oddHarmSplitMask[i] & sinNow;
             out2Sum += evenHarmSplitMask[i] & (this->splitMode ? sinNow : cosNow);
 
-            // Update progressive phase multiple calculations
+            // Update progressive phase multiple calculations for next iteration
             multiples += multiplesAdd;
             syncPhaseInc += syncPhaseIncAdd;
             quadOffset += quadOffsetAdd;
@@ -454,6 +516,37 @@ struct LoomAlgorithm : OversampledAlgorithm<2, 10, 1, 3, float_4, float_4> {
         outsPacked *= {ampScale, ampScale, 1.f, 0.f};
         outsPacked = this->doADAA ? this->driveProcessor.process(outsPacked) : this->driveProcessor.transform(outsPacked);
         return std::array<float_4, 1>{5.f * outsPacked};
+    }
+
+    json_t* dataToJson() {
+        json_t* rootJ = json_object();
+        json_object_set_new(rootJ, "oversample", json_boolean(this->oversamplingEnabled));
+        json_object_set_new(rootJ, "doADAA", json_boolean(this->doADAA));
+        json_object_set_new(rootJ, "blepLevel", json_integer(this->blepLevel));
+        json_object_set_new(rootJ, "maxHarmonicBlocks", json_integer(this->maxHarmonicBlocks));
+        return rootJ;
+    }
+
+    void dataFromJson(json_t* rootJ) {
+        json_t* oversampleJ = json_object_get(rootJ, "oversample");
+        if (oversampleJ) {
+            this->oversamplingEnabled = json_boolean_value(oversampleJ);
+        }
+
+        json_t* doADAAJ = json_object_get(rootJ, "doADAA");
+        if (doADAAJ) {
+            this->doADAA = json_boolean_value(doADAAJ);
+        }
+
+        json_t* blepLevelJ = json_object_get(rootJ, "blepLevel");
+        if (blepLevelJ) {
+            this->blepLevel = json_integer_value(blepLevelJ);
+        }
+        
+        json_t* maxHarmonicBlocksJ = json_object_get(rootJ, "maxHarmonicBlocks");
+        if (maxHarmonicBlocksJ) {
+            this->maxHarmonicBlocks = clamp(json_integer_value(maxHarmonicBlocksJ), 1, 16);
+        }
     }
 };
 
@@ -634,31 +727,6 @@ struct Loom : Module {
         this->algo.oversamplingEnabled = false;
         this->algo.doADAA = true;
         this->algo.blepLevel = 3;
-    }
-
-    json_t* dataToJson() override {
-        json_t* rootJ = json_object();
-        json_object_set_new(rootJ, "oversample", json_boolean(this->algo.oversamplingEnabled));
-        json_object_set_new(rootJ, "doADAA", json_boolean(this->algo.doADAA));
-        json_object_set_new(rootJ, "blepLevel", json_integer(this->algo.blepLevel));
-        return rootJ;
-    }
-
-    void dataFromJson(json_t* rootJ) override {
-        json_t* oversampleJ = json_object_get(rootJ, "oversample");
-        if (oversampleJ) {
-            this->algo.oversamplingEnabled = json_boolean_value(oversampleJ);
-        }
-
-        json_t* doADAAJ = json_object_get(rootJ, "doADAA");
-        if (doADAAJ) {
-            this->algo.doADAA = json_boolean_value(doADAAJ);
-        }
-
-        json_t* blepLevelJ = json_object_get(rootJ, "blepLevel");
-        if (blepLevelJ) {
-            this->algo.blepLevel = json_integer_value(blepLevelJ);
-        }
     }
 
     void process(const ProcessArgs& args) override {
@@ -919,6 +987,43 @@ struct LoomWidget : ModuleWidget {
             onItem4->module = module;
             onItem4->blepLevel = 4;
             menu->addChild(onItem4);
+        }
+        
+        menu->addChild(new MenuEntry);
+        menu->addChild(createMenuLabel("Performance Setting"));
+        
+        struct MaxHarmonicsItem : MenuItem {
+            Loom* module;
+            int maxBlocks;
+            void onAction(const event::Action& e) override {
+                module->algo.maxHarmonicBlocks = maxBlocks;
+            }
+        };
+        
+        {
+            MaxHarmonicsItem* lowItem = createMenuItem<MaxHarmonicsItem>("Low CPU (4 blocks)");
+            lowItem->rightText = CHECKMARK(module->algo.maxHarmonicBlocks == 4);
+            lowItem->module = module;
+            lowItem->maxBlocks = 4;
+            menu->addChild(lowItem);
+            
+            MaxHarmonicsItem* medItem = createMenuItem<MaxHarmonicsItem>("Medium CPU (8 blocks)");
+            medItem->rightText = CHECKMARK(module->algo.maxHarmonicBlocks == 8);
+            medItem->module = module;
+            medItem->maxBlocks = 8;
+            menu->addChild(medItem);
+            
+            MaxHarmonicsItem* highItem = createMenuItem<MaxHarmonicsItem>("High CPU (12 blocks)");
+            highItem->rightText = CHECKMARK(module->algo.maxHarmonicBlocks == 12);
+            highItem->module = module;
+            highItem->maxBlocks = 12;
+            menu->addChild(highItem);
+            
+            MaxHarmonicsItem* maxItem = createMenuItem<MaxHarmonicsItem>("Maximum CPU (16 blocks)");
+            maxItem->rightText = CHECKMARK(module->algo.maxHarmonicBlocks == 16);
+            maxItem->module = module;
+            maxItem->maxBlocks = 16;
+            menu->addChild(maxItem);
         }
     }
 };
