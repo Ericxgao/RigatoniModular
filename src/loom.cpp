@@ -729,6 +729,10 @@ struct Loom : Module {
         if (blepLevelJ) {
             this->algo.blepLevel = json_integer_value(blepLevelJ);
         }
+
+        #ifdef METAMODULE
+        this->algo.oversamplingEnabled = false;
+        #endif
     }
 
     void process(const ProcessArgs& args) override {
